@@ -36,7 +36,7 @@ float output_scale;
 int output_zero_point;
 
 // Threshold
-const float kReconstructionErrorThreshold = 1.5;
+const float kReconstructionErrorThreshold = 0.5059;
 
 void setup() {
   Serial.begin(115200);
