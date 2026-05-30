@@ -7,20 +7,32 @@
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "tensorflow/lite/version.h"
 
+#include <ArduinoBLE.h>
 #include <math.h>
+#include <Arduino_BMI270_BMM150.h>
 
 // ============================================================
-// IMU library selection
+// BLE settings
 // ============================================================
-// For Arduino Nano 33 BLE Sense Rev2, use 1.
-// For original Nano 33 BLE / Nano 33 BLE Sense, use 0.
-#define USE_REV2_IMU 1
+BLEService fallService("19B10000-E8F2-537E-4F6C-D104768A1214");
 
-#if USE_REV2_IMU
-  #include <Arduino_BMI270_BMM150.h>
-#else
-  #include <Arduino_LSM9DS1.h>
-#endif
+// Phone can subscribe to this characteristic.
+// It sends strings like:
+// NORMAL,prob=0.1234
+// FALL_ALERT,prob=0.9876
+BLEStringCharacteristic fallStatusCharacteristic(
+  "19B10001-E8F2-537E-4F6C-D104768A1214",
+  BLERead | BLENotify,
+  64
+);
+
+// 0 = normal, 1 = fall
+BLEByteCharacteristic fallStateCharacteristic(
+  "19B10002-E8F2-537E-4F6C-D104768A1214",
+  BLERead | BLENotify
+);
+
+bool bleReady = false;
 
 // ============================================================
 // Model settings
@@ -29,18 +41,10 @@ const int kWindowSize = 151;
 const int kNumAxes = 3;
 const int kInputSize = kWindowSize * kNumAxes;
 
-// UniMiB-SHAR uses accelerometer windows.
-// Input shape should be: [1, 151, 3]
-
 // ============================================================
 // Normalization constants
 // ============================================================
-// IMPORTANT:
-// Replace these with values from your zscore_stats.json if available.
-// For first compile/upload test, these placeholder values are okay.
-// But for meaningful real Arduino predictions, use the same normalization
-// used during training.
-
+// Replace these with your real zscore_stats.json values if you have them.
 const float AX_MEAN = 0.0f;
 const float AY_MEAN = 0.0f;
 const float AZ_MEAN = 0.0f;
@@ -53,9 +57,6 @@ const float AZ_STD = 1.0f;
 // Detection settings
 // ============================================================
 const float kFallThreshold = 0.5f;
-
-// UniMiB-SHAR is commonly treated around 50 Hz.
-// 20 ms/sample gives about 3 seconds per 151-sample window.
 const unsigned long kSampleIntervalMs = 20;
 
 // ============================================================
@@ -70,7 +71,7 @@ tflite::MicroInterpreter* interpreter = nullptr;
 TfLiteTensor* input = nullptr;
 TfLiteTensor* output = nullptr;
 
-// Increase this if AllocateTensors() fails.
+// If BLE + model causes memory problems, try 70 * 1024 or 90 * 1024.
 constexpr int kTensorArenaSize = 80 * 1024;
 alignas(16) uint8_t tensor_arena[kTensorArenaSize];
 
@@ -135,34 +136,108 @@ void printTensorInfo() {
   Serial.println("=================================");
 }
 
+void setupBLE() {
+  if (!BLE.begin()) {
+    Serial.println("ERROR: Failed to initialize BLE.");
+    bleReady = false;
+    return;
+  }
+
+  BLE.setLocalName("Nano33-Fall-Detector");
+  BLE.setDeviceName("Nano33-Fall-Detector");
+  BLE.setAdvertisedService(fallService);
+
+  fallService.addCharacteristic(fallStatusCharacteristic);
+  fallService.addCharacteristic(fallStateCharacteristic);
+
+  BLE.addService(fallService);
+
+  fallStatusCharacteristic.writeValue("BOOTING");
+  fallStateCharacteristic.writeValue((byte)0);
+
+  BLE.advertise();
+
+  bleReady = true;
+
+  Serial.println("BLE initialized.");
+  Serial.println("Device name: Nano33-Fall-Detector");
+  Serial.println("Use nRF Connect or LightBlue on your phone.");
+  Serial.println("Subscribe to characteristic:");
+  Serial.println("19B10001-E8F2-537E-4F6C-D104768A1214");
+}
+
+void sendBLEStatus(bool fallDetected, float probability) {
+  if (!bleReady) {
+    return;
+  }
+
+  String message;
+
+  if (fallDetected) {
+    message = "FALL_ALERT,prob=";
+    fallStateCharacteristic.writeValue((byte)1);
+  } else {
+    message = "NORMAL,prob=";
+    fallStateCharacteristic.writeValue((byte)0);
+  }
+
+  message += String(probability, 4);
+
+  fallStatusCharacteristic.writeValue(message.c_str());
+
+  Serial.print("BLE update: ");
+  Serial.println(message);
+}
+
+void blinkFallAlert() {
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  unsigned long startTime = millis();
+  while (millis() - startTime < 1000) {
+    BLE.poll();
+    delay(10);
+  }
+
+  digitalWrite(LED_BUILTIN, LOW);
+}
+
 // ============================================================
 // Setup
 // ============================================================
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial);
+
+  // Do not block forever waiting for Serial.
+  // This lets the board still run from battery.
+  unsigned long serialStart = millis();
+  while (!Serial && millis() - serialStart < 3000);
 
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
   Serial.println();
   Serial.println("======================================");
-  Serial.println("TinyML Fall Detection Deployment");
+  Serial.println("TinyML Fall Detection with BLE Alert");
   Serial.println("Arduino Nano 33 BLE");
   Serial.println("Model: CNN Full INT8 Quantized");
   Serial.println("Input: 151 x 3 accelerometer window");
-  Serial.println("Output: fall probability");
   Serial.println("======================================");
+
+  setupBLE();
 
   if (!IMU.begin()) {
     Serial.println("ERROR: Failed to initialize IMU.");
-    while (1);
+    sendBLEStatus(true, 1.0f);
+    while (1) {
+      BLE.poll();
+      delay(100);
+    }
   }
 
   Serial.println("IMU initialized.");
 
-  model = tflite::GetModel(fall_detection_cnn_int8_tflite);
+  model = tflite::GetModel(fall_detection_dnn_int8_tflite);
 
   if (model->version() != TFLITE_SCHEMA_VERSION) {
     Serial.println("ERROR: Model schema version mismatch.");
@@ -170,7 +245,11 @@ void setup() {
     Serial.println(model->version());
     Serial.print("Expected version: ");
     Serial.println(TFLITE_SCHEMA_VERSION);
-    while (1);
+
+    while (1) {
+      BLE.poll();
+      delay(100);
+    }
   }
 
   static tflite::AllOpsResolver resolver;
@@ -190,7 +269,11 @@ void setup() {
   if (allocate_status != kTfLiteOk) {
     Serial.println("ERROR: AllocateTensors() failed.");
     Serial.println("Try increasing kTensorArenaSize.");
-    while (1);
+
+    while (1) {
+      BLE.poll();
+      delay(100);
+    }
   }
 
   input = interpreter->input(0);
@@ -198,6 +281,8 @@ void setup() {
 
   Serial.println("Model loaded successfully.");
   printTensorInfo();
+
+  sendBLEStatus(false, 0.0f);
 
   Serial.println("Starting real-time fall detection...");
 }
@@ -207,15 +292,20 @@ void setup() {
 // ============================================================
 
 void loop() {
+  BLE.poll();
+
   int input_index = 0;
 
   Serial.println();
   Serial.println("Collecting 151-sample window...");
 
   for (int i = 0; i < kWindowSize; i++) {
+    BLE.poll();
+
     float ax, ay, az;
 
     while (!IMU.accelerationAvailable()) {
+      BLE.poll();
       delay(1);
     }
 
@@ -253,15 +343,18 @@ void loop() {
   Serial.print("Fall probability: ");
   Serial.println(fall_probability, 4);
 
-  if (fall_probability >= kFallThreshold) {
+  bool fallDetected = fall_probability >= kFallThreshold;
+
+  if (fallDetected) {
     Serial.println("RESULT: POSSIBLE FALL DETECTED");
-    digitalWrite(LED_BUILTIN, HIGH);
-    delay(1000);
-    digitalWrite(LED_BUILTIN, LOW);
+    sendBLEStatus(true, fall_probability);
+    blinkFallAlert();
   } else {
     Serial.println("RESULT: Normal activity");
+    sendBLEStatus(false, fall_probability);
     digitalWrite(LED_BUILTIN, LOW);
   }
 
+  BLE.poll();
   delay(500);
 }
